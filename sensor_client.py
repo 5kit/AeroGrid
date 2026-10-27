@@ -1,11 +1,56 @@
 import csv
 from datetime import datetime, timedelta
 import io
+import os
 import random
 import time
 import zipfile
 import boto3
-import os
+from botocore.exceptions import EndpointConnectionError, ClientError
+
+
+# ============================================================
+# AWS Environment & Configuration
+# ============================================================
+
+ENDPOINT_URL = os.getenv(
+    "AWS_ENDPOINT_URL",
+    "http://localhost:4566"
+)
+
+aws_config = {
+    "endpoint_url": ENDPOINT_URL,
+    "region_name": "eu-west-2",
+    "aws_access_key_id": "test",
+    "aws_secret_access_key": "test",
+}
+
+
+# ============================================================
+# Wait for LocalStack Readiness
+# ============================================================
+
+def wait_for_localstack(max_retries=30, delay_seconds=2):
+    """
+    Poll LocalStack using boto3 until the service endpoint is reachable.
+    """
+    print(f"Connecting to LocalStack at {ENDPOINT_URL}...")
+    s3_check = boto3.client("s3", **aws_config)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            s3_check.list_buckets()
+            print("LocalStack is up and ready!\n")
+            return True
+        except (EndpointConnectionError, ClientError) as err:
+            print(f"[{attempt}/{max_retries}] Waiting for LocalStack to boot... ({err})")
+            time.sleep(delay_seconds)
+
+    raise RuntimeError(f"Could not connect to LocalStack at {ENDPOINT_URL} after {max_retries} attempts.")
+
+
+# Run the readiness check before proceeding
+wait_for_localstack()
 
 
 # ============================================================
@@ -29,23 +74,9 @@ with zipfile.ZipFile(zip_path, "r") as zipf:
 # Initialize AWS clients
 # ============================================================
 
-ENDPOINT_URL = os.getenv(
-    "AWS_ENDPOINT_URL",
-    "http://localhost:4566"
-)
-
-aws_config = {
-    "endpoint_url": ENDPOINT_URL,
-    "region_name": "eu-west-2",
-    "aws_access_key_id": "test",
-    "aws_secret_access_key": "test",
-}
-
 s3 = boto3.client("s3", **aws_config)
-
 lambda_client = boto3.client("lambda", **aws_config)
-
-dynamodb = boto3.client("dynamodb", **aws_config)
+dynamodb_client = boto3.client("dynamodb", **aws_config)
 
 
 # ============================================================
@@ -61,25 +92,16 @@ try:
             "LocationConstraint": "eu-west-2"
         }
     )
-
     print(f"S3 bucket '{bucket_name}' created.")
-
 except s3.exceptions.BucketAlreadyOwnedByYou:
+    print(f"S3 bucket '{bucket_name}' already exists.")
+except s3.exceptions.BucketAlreadyExists:
     print(f"S3 bucket '{bucket_name}' already exists.")
 
 
 # ============================================================
-# Initialize DynamoDB table
+# Initialize DynamoDB tables
 # ============================================================
-
-# Create DynamoDB tables with a composite primary key (turbine_id + batch_end)
-dynamodb_client = boto3.client(
-    "dynamodb",
-    endpoint_url=ENDPOINT_URL,
-    region_name="eu-west-2",
-    aws_access_key_id="test",
-    aws_secret_access_key="test",
-)
 
 tables_to_create = ["telemetry", "anomalies"]
 for table_name in tables_to_create:
@@ -87,8 +109,8 @@ for table_name in tables_to_create:
         dynamodb_client.create_table(
             TableName=table_name,
             KeySchema=[
-                {"AttributeName": "turbine_id", "KeyType": "HASH"},  # Partition Key
-                {"AttributeName": "batch_start", "KeyType": "RANGE"}   # Sort Key (keeps history!)
+                {"AttributeName": "turbine_id", "KeyType": "HASH"},   # Partition Key
+                {"AttributeName": "batch_start", "KeyType": "RANGE"}   # Sort Key
             ],
             AttributeDefinitions=[
                 {"AttributeName": "turbine_id", "AttributeType": "S"},
@@ -100,28 +122,24 @@ for table_name in tables_to_create:
     except dynamodb_client.exceptions.ResourceInUseException:
         print(f"DynamoDB table '{table_name}' already exists.")
 
+
 # ============================================================
 # Package and deploy Lambda
 # ============================================================
 
-with open("lambda.zip", "rb") as f:
+with open(zip_path, "rb") as f:
     zipped_code = f.read()
 
 function_name = "process-sensor-data"
 
-# Delete previous version so that the code is always updated
+# Delete previous version so that code is updated dynamically
 try:
-    lambda_client.delete_function(
-        FunctionName=function_name
-    )
-
+    lambda_client.delete_function(FunctionName=function_name)
     print(f"Deleted existing Lambda '{function_name}'.")
-
 except Exception:
     pass
 
-
-lambda_client.create_function(
+lambda_response = lambda_client.create_function(
     FunctionName=function_name,
     Runtime="python3.10",
     Role="arn:aws:iam::000000000000:role/lambda-role",
@@ -131,7 +149,9 @@ lambda_client.create_function(
     },
 )
 
+lambda_arn = lambda_response["FunctionArn"]
 print(f"Lambda function '{function_name}' deployed successfully!")
+print(f"Lambda ARN: {lambda_arn}")
 
 
 # ============================================================
@@ -145,19 +165,20 @@ try:
         Action="lambda:InvokeFunction",
         Principal="s3.amazonaws.com",
         SourceArn=f"arn:aws:s3:::{bucket_name}",
+        SourceAccount="000000000000"
     )
-
     print("Lambda permission granted to S3!")
-
-except Exception:
+except lambda_client.exceptions.ResourceConflictException:
     print("Lambda permission already exists.")
+except Exception as e:
+    print(f"Notice on add_permission: {e}")
 
-
-time.sleep(1)
+# Pause briefly for LocalStack event-bus propagation
+time.sleep(2)
 
 
 # ============================================================
-# Configure S3 → Lambda event
+# Configure S3 -> Lambda event
 # ============================================================
 
 s3.put_bucket_notification_configuration(
@@ -165,9 +186,7 @@ s3.put_bucket_notification_configuration(
     NotificationConfiguration={
         "LambdaFunctionConfigurations": [
             {
-                "LambdaFunctionArn":
-                    f"arn:aws:lambda:eu-west-2:000000000000:function:{function_name}",
-
+                "LambdaFunctionArn": lambda_arn,
                 "Events": [
                     "s3:ObjectCreated:*"
                 ]
@@ -178,18 +197,16 @@ s3.put_bucket_notification_configuration(
 
 print("S3 bucket notification successfully configured!")
 
-
 print("\n========================================")
 print("        AeroGrid Telemetry Simulator")
 print("========================================")
 print("LocalStack API:  ", ENDPOINT_URL)
-print("LocalStack UI:   https://app.localstack.cloud")
-print("S3 bucket:        sensor-data")
+print("S3 bucket:       ", bucket_name)
 print("========================================\n")
 
 
 # ============================================================
-# Turbine simulation
+# Turbine simulation setup
 # ============================================================
 
 turbine_ids = [
@@ -203,24 +220,15 @@ turbine_ids = [
     "T-09"
 ]
 
-
-# Maintain state so values drift rather than jumping randomly
 turbine_states = {}
 
 for turbine_id in turbine_ids:
-
     if turbine_id == "T-04":
-        # Slightly elevated temperature.
-        # The average should remain just above 85°C.
         initial_temperature = random.uniform(85.5, 87.0)
         initial_vibration = random.uniform(3, 8)
-
     elif turbine_id == "T-07":
-        # Slightly elevated vibration.
-        # Occasional readings should cross 15 mm/s.
         initial_temperature = random.uniform(50, 70)
         initial_vibration = random.uniform(15.2, 16.2)
-
     else:
         initial_temperature = random.uniform(50, 70)
         initial_vibration = random.uniform(3, 8)
@@ -231,8 +239,7 @@ for turbine_id in turbine_ids:
         "rpm": round(random.uniform(10, 20), 1)
     }
 
-
-print("\nStarting 10-minute telemetry batches...")
+print("Starting 10-minute telemetry batches...")
 print("Press Ctrl+C to stop.\n")
 
 
@@ -240,19 +247,15 @@ print("Press Ctrl+C to stop.\n")
 # Generate and upload batches
 # ============================================================
 
+SAMPLES_PER_BATCH = 100
+BATCH_DURATION_MINUTES = 10
+
 try:
-
     while True:
-
         batch_start = datetime.now()
-
-        print(
-            f"Generating telemetry batch starting "
-            f"{batch_start.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        print(f"Generating telemetry batch starting {batch_start.strftime('%Y-%m-%d %H:%M:%S')}")
 
         csv_buffer = io.StringIO()
-
         writer = csv.writer(csv_buffer)
 
         writer.writerow([
@@ -263,111 +266,51 @@ try:
             "rpm"
         ])
 
-
         # ----------------------------------------------------
-        # Generate 10 simulated minutes of telemetry
+        # Generate simulated minutes of telemetry
         # ----------------------------------------------------
-
-        simulated_time = batch_start
-
-        for minute in range(10):
+        for sample_index in range(SAMPLES_PER_BATCH):
+            seconds_offset = (BATCH_DURATION_MINUTES * 60 * sample_index) / SAMPLES_PER_BATCH
+            simulated_time = batch_start + timedelta(seconds=seconds_offset)
 
             timestamp_str = (
-                f"{simulated_time.month}/"
-                f"{simulated_time.day}/"
+                f"{simulated_time.month:02d}/"
+                f"{simulated_time.day:02d}/"
                 f"{simulated_time.year} "
                 f"{simulated_time.strftime('%H:%M:%S')}"
             )
 
-            # Every turbine reports once during each simulated minute
             for turbine_id in turbine_ids:
-
                 state = turbine_states[turbine_id]
 
-                # --------------------------------------------
-                # Temperature
-                # --------------------------------------------
-
+                # Temperature simulation step
                 if turbine_id == "T-04":
-
-                    # Small fluctuations around the threshold.
-                    # This should keep the batch average just
-                    # above 85°C without looking artificial.
                     state["temperature_c"] = round(
-                        state["temperature_c"]
-                        + random.uniform(-0.6, 0.6),
-                        1
+                        state["temperature_c"] + random.uniform(-0.6, 0.6), 1
                     )
-
-                    state["temperature_c"] = max(
-                        85.1,
-                        min(88.0, state["temperature_c"])
-                    )
-
+                    state["temperature_c"] = max(85.1, min(88.0, state["temperature_c"]))
                 else:
-
                     state["temperature_c"] = round(
-                        state["temperature_c"]
-                        + random.uniform(-1.5, 1.5),
-                        1
+                        state["temperature_c"] + random.uniform(-1.5, 1.5), 1
                     )
+                    state["temperature_c"] = max(40.0, min(80.0, state["temperature_c"]))
 
-                    state["temperature_c"] = max(
-                        40,
-                        min(80, state["temperature_c"])
-                    )
-
-
-                # --------------------------------------------
-                # Vibration
-                # --------------------------------------------
-
+                # Vibration simulation step
                 if turbine_id == "T-07":
-
-                    # Keep vibration close to the threshold.
-                    # The maximum should exceed 15 mm/s,
-                    # but only slightly.
                     state["vibration_mm_s"] = round(
-                        state["vibration_mm_s"]
-                        + random.uniform(-0.3, 0.3),
-                        1
+                        state["vibration_mm_s"] + random.uniform(-0.3, 0.3), 1
                     )
-
-                    state["vibration_mm_s"] = max(
-                        15.1,
-                        min(17.0, state["vibration_mm_s"])
-                    )
-
+                    state["vibration_mm_s"] = max(15.1, min(17.0, state["vibration_mm_s"]))
                 else:
-
                     state["vibration_mm_s"] = round(
-                        max(
-                            0,
-                            state["vibration_mm_s"]
-                            + random.uniform(-0.4, 0.4)
-                        ),
-                        1
+                        max(0.0, state["vibration_mm_s"] + random.uniform(-0.4, 0.4)), 1
                     )
+                    state["vibration_mm_s"] = min(12.0, state["vibration_mm_s"])
 
-                    state["vibration_mm_s"] = min(
-                        12,
-                        state["vibration_mm_s"]
-                    )
-
-
-                # --------------------------------------------
-                # RPM
-                # --------------------------------------------
-
+                # RPM simulation step
                 state["rpm"] = round(
-                    max(
-                        0,
-                        state["rpm"]
-                        + random.uniform(-1.5, 1.5)
-                    ),
-                    1
+                    max(0.0, state["rpm"] + random.uniform(-1.5, 1.5)), 1
                 )
-
 
                 writer.writerow([
                     timestamp_str,
@@ -377,19 +320,10 @@ try:
                     state["rpm"]
                 ])
 
-
-            # Move simulated clock forward one minute
-            simulated_time += timedelta(minutes=1)
-
-
         # ----------------------------------------------------
-        # Upload the completed 10-minute batch to S3
+        # Upload batch to S3
         # ----------------------------------------------------
-
-        file_key = (
-            f"polls/"
-            f"batch_{batch_start.strftime('%Y%m%d_%H%M%S_%f')}.csv"
-        )
+        file_key = f"polls/batch_{batch_start.strftime('%Y%m%d_%H%M%S_%f')}.csv"
 
         s3.put_object(
             Bucket=bucket_name,
@@ -397,26 +331,12 @@ try:
             Body=csv_buffer.getvalue()
         )
 
-        print(
-            f"Uploaded 10-minute telemetry batch -> "
-            f"s3://{bucket_name}/{file_key}"
-        )
+        total_records_sent = SAMPLES_PER_BATCH * len(turbine_ids)
+        print(f"Uploaded telemetry batch -> s3://{bucket_name}/{file_key}")
+        print(f"Records uploaded: {total_records_sent}")
 
-        print(
-            f"Records uploaded: "
-            f"{10 * len(turbine_ids)}"
-        )
-
-
-        # ----------------------------------------------------
-        # Wait before next batch
-        # ----------------------------------------------------
-
-        print("Waiting 10 minutes for next batch...\n")
-
+        print("Waiting 10 seconds for next batch trigger...\n")
         time.sleep(10)
 
-
 except KeyboardInterrupt:
-
     print("\nTelemetry simulation stopped.")

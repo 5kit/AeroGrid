@@ -2,232 +2,182 @@
 
 A local AWS-style telemetry pipeline for simulating and analysing wind turbine sensor data.
 
-The project started as a CSV-based telemetry analysis task and was extended into a small event-driven cloud architecture using **Docker and LocalStack**. It simulates turbine telemetry, stores raw batches in S3, processes them with Lambda, and stores analysed results in DynamoDB.
+The project started as a CSV-based telemetry analysis task and was extended into a small event-driven cloud architecture using **Docker and LocalStack**. It simulates turbine telemetry, streams raw CSV batches to S3, processes them asynchronously with Lambda, and writes aggregate metrics and anomalies to DynamoDB.
 
 ## Architecture
 
 ```text
-Turbine Simulator
-       │
-       │ 10-minute telemetry batch
-       ▼
-     S3
-       │
-       │ ObjectCreated
-       ▼
-    Lambda
-       │
-       ├───────────────┐
-       ▼               ▼
-  telemetry        anomalies
-  DynamoDB          DynamoDB
+  ┌─────────────────────────────────┐
+  │  Turbine Simulator Container    │
+  │  (sensor_client.py)             │
+  └────────────────┬────────────────┘
+                   │ 10-min telemetry batch (CSV)
+                   ▼
+  ┌─────────────────────────────────┐
+  │  Amazon S3                      │
+  │  s3://sensor-data/polls/        │
+  └────────────────┬────────────────┘
+                   │ s3:ObjectCreated:* Event
+                   ▼
+  ┌─────────────────────────────────┐
+  │  AWS Lambda                     │
+  │  (Streaming DictReader + P95/P99)│
+  └───────┬─────────────────┬───────┘
+          │                 │ BatchWriter
+          ▼                 ▼
+  ┌───────────────┐   ┌───────────────┐
+  │   telemetry   │   │   anomalies   │
+  │   DynamoDB    │   │   DynamoDB    │
+  └───────────────┘   └───────────────┘
+
 ```
 
-LocalStack provides the AWS services locally, so the entire pipeline can be developed and tested without deploying to AWS.
+LocalStack provides AWS services locally so the entire pipeline runs end-to-end without cloud costs or AWS credentials.
 
-## What it does
+---
 
-The simulator generates telemetry for eight turbines:
+## What It Does
 
-* Temperature
-* Vibration
+The simulator generates streaming telemetry across eight turbines (`T-01` through `T-09`):
+
+* Temperature (°C)
+* Vibration (mm/s)
 * RPM
 * Timestamp
 
-Each batch contains 10 simulated minutes of readings and is uploaded to an S3 bucket as a CSV file.
+Each batch contains 10 simulated minutes of readings (100 sample intervals across all turbines) and is uploaded to an S3 bucket as a CSV file.
 
-When a CSV is uploaded:
+### Pipeline Execution Flow
 
-1. S3 triggers the Lambda function.
-2. Lambda downloads the CSV.
-3. Readings are grouped by turbine.
-4. Batch-level statistics are calculated.
-5. Results are written to DynamoDB.
-6. Anomalous turbine batches are also written to a separate `anomalies` table.
+1. **Upload Event:** S3 receives a new batch and triggers an `s3:ObjectCreated:*` event to Lambda.
+2. **Streamed Ingestion:** Lambda reads the file line-by-line (`response["Body"].iter_lines()`) directly from the HTTP stream to avoid loading large payloads into memory.
+3. **Statistical Analysis:** Readings are grouped by turbine to calculate average, maximum, and percentile metrics (95th percentile temperature and 99th percentile vibration using linear interpolation).
+4. **Batch Writes:** Aggregated summaries are pushed to DynamoDB via `boto3.batch_writer()` to reduce API call overhead.
+5. **Anomaly Storage:** Turbine summaries violating threshold criteria are also saved to a separate `anomalies` table.
 
-### Anomaly detection
+---
 
-The current thresholds are:
+## Anomaly Detection & Metrics
 
-```text
-Average temperature > 85°C
-Maximum vibration > 15 mm/s
-```
+Anomalies are flagged using 95th and 99th percentile thresholds:
 
-The simulator intentionally produces two anomalous turbines:
+| Metric | Threshold Criteria | Target Turbine Behavior |
+| --- | --- | --- |
+| **P95 Temperature** | `> 85.0°C` | **T-04** (fluctuates around 85.1°C – 88.0°C) |
+| **P99 Vibration** | `> 15.0 mm/s` | **T-07** (fluctuates around 15.1 mm/s – 17.0 mm/s) |
 
-* **T-04** — elevated temperature
-* **T-07** — elevated vibration
+Values drift within narrow ranges near the thresholds to simulate realistic hardware degradation rather than artificial sudden spikes.
 
-The values are kept close to the thresholds rather than generating extreme failures.
+---
 
-## AWS services
+## AWS Services & Infrastructure
 
-| Service    | Purpose                                       |
-| ---------- | --------------------------------------------- |
-| S3         | Stores raw telemetry CSV batches              |
-| Lambda     | Processes uploaded telemetry                  |
-| DynamoDB   | Stores processed telemetry and anomalies      |
-| LocalStack | Runs the AWS services locally                 |
-| Docker     | Runs the simulator in an isolated environment |
+| Service / Tool | Purpose | Implementation Details |
+| --- | --- | --- |
+| **Amazon S3** | Raw telemetry storage | Bucket `sensor-data` receiving raw CSV files |
+| **AWS Lambda** | Stream processing | Python 3.10 event handler with S3 body generator |
+| **Amazon DynamoDB** | Database storage | Composite key tables `telemetry` & `anomalies` |
+| **LocalStack** | Local AWS emulator | Simulates S3, Lambda, DynamoDB, and IAM locally |
+| **Docker Compose** | Multi-container setup | Manages container execution, networking, and health checks |
 
-The same architecture could later be deployed to AWS using S3, Lambda, and DynamoDB directly.
+---
 
-## Project structure
+## Project Structure
 
 ```text
 AeroGrid/
-├── sensor_client.py
-├── Dockerfile
-├── lambda/
-│   └── handler.py
-├── lambda.zip
-└── README.md
+├── docker-compose.yml     # LocalStack & simulator container orchestration
+├── Dockerfile             # Simulator container definition
+├── sensor_client.py       # Infrastructure setup, wait_for_localstack, & generator loop
+├── verify_db.py           # CLI script to inspect DynamoDB tables directly
+├── export_csv.py          # Script for exporting DynamoDB data back to ISO CSV files
+└── lambda/
+    └── handler.py         # Memory-efficient Lambda processor using batch_writer
+
 ```
 
-`lambda.zip` is generated automatically and is ignored by Git.
+---
 
-## Running locally
+## Running Locally
 
-### Requirements
+### Prerequisites
 
-* Docker
-* LocalStack
-* Python 3.10+ if running the simulator directly
+* [Docker Desktop](https://www.docker.com/products/docker-desktop/) with Docker Compose.
+* Python 3.10+ (optional, for local verification scripts).
 
-### 1. Start LocalStack
+### 1. Launch Stack with Docker Compose
 
-Start LocalStack with S3, Lambda and DynamoDB available.
-
-The local AWS endpoint is:
-
-```text
-http://localhost:4566
-```
-
-The LocalStack Web Application can be accessed at:
-
-[https://app.localstack.cloud](https://app.localstack.cloud?utm_source=chatgpt.com)
-
-From the Web Application you can inspect the local AWS resources created by AeroGrid, including S3 buckets, Lambda functions and DynamoDB tables.
-
-### 2. Build the simulator
+Start LocalStack and the containerized simulator:
 
 ```bash
-docker build -t turbine-simulator .
+docker-compose up --build
+
 ```
 
-### 3. Run the simulator
+`sensor_client.py` uses built-in health checking (`wait_for_localstack()`) to wait until LocalStack services are ready before initializing S3 buckets, DynamoDB tables, and Lambda triggers.
 
-The simulator needs to be on the same Docker network as LocalStack.
+### 2. Verify Ingested Records
 
-For example:
+In a separate terminal, scan the processed DynamoDB summary items:
 
 ```bash
-docker run --rm --network localstack-net -e AWS_ENDPOINT_URL=http://localstack-aws:4566 turbine-simulator
+python verify_db.py
+
 ```
 
-Replace `localstack` with the actual LocalStack container/service name if different.
+### 3. Export Summary Data to CSV
 
+Export table records into sorted ISO 8601 CSV files:
 
-You should then see output similar to:
+```bash
+python export_csv.py
 
-```text
-========================================
-        AeroGrid Telemetry Simulator
-========================================
-LocalStack API:   http://localstack-aws:4566
-LocalStack UI:    https://app.localstack.cloud
-S3 bucket:        sensor-data
-========================================
-
-Starting 10-minute telemetry batches...
-
-Generating telemetry batch starting 2026-09-30 01:12:34
-Uploaded 10-minute telemetry batch ->
-s3://sensor-data/polls/batch_20260930_011234_123456.csv
-
-Records uploaded: 80
 ```
 
-The simulator currently waits **6 seconds** between batches so the pipeline can be tested quickly. Each generated batch represents 10 simulated minutes of telemetry.
+Generates `telemetry.csv` and `anomalies.csv` with calculated percentiles (`p95_temp_c`, `p99_vibration_mm_s`).
 
-## DynamoDB schema
+---
 
-### `telemetry`
+## DynamoDB Data Schema
 
-Stores one summary record per turbine per batch.
+Both `telemetry` and `anomalies` tables share a composite primary key layout:
 
-```text
-Partition key: turbine_id
-Sort key:      batch_start
+* **Partition Key (`HASH`):** `turbine_id` (String)
+* **Sort Key (`RANGE`):** `batch_start` (String)
+
+### Example Record JSON
+
+```json
+{
+  "turbine_id": "T-04",
+  "batch_start": "10/27/2026 13:00:00",
+  "batch_end": "10/27/2026 13:10:00",
+  "avg_temp_c": 86.42,
+  "max_temp_c": 87.90,
+  "p95_temp_c": 87.55,
+  "avg_vibration_mm_s": 5.12,
+  "max_vibration_mm_s": 7.80,
+  "p99_vibration_mm_s": 7.65,
+  "avg_rpm": 14.80,
+  "temperature_anomaly": true,
+  "vibration_anomaly": false
+}
+
 ```
 
-Example attributes:
+---
 
-```text
-turbine_id
-batch_start
-batch_end
-avg_temp_c
-max_temp_c
-avg_vibration_mm_s
-max_vibration_mm_s
-avg_rpm
-temperature_anomaly
-vibration_anomaly
-```
+## Performance Optimizations
 
-### `anomalies`
+* **Streamed Ingestion:** Decodes S3 object lines on the fly via `iter_lines()` to maintain minimal memory usage inside Lambda regardless of CSV file size.
+* **Bulk DynamoDB Writes:** Uses `boto3.batch_writer()` to buffer up to 25 items per request, reducing API latency and network overhead.
 
-Contains only batches where an anomaly was detected.
+---
 
-```text
-Partition key: turbine_id
-Sort key:      batch_start
-```
+## Future Improvements
 
-This keeps the complete raw telemetry in S3 while DynamoDB contains queryable summaries.
-
-## Why S3 + DynamoDB?
-
-S3 is used as the raw telemetry store because the original CSV batches are retained in their entirety.
-
-DynamoDB is used for processed summaries because applications can query individual turbines and time ranges without repeatedly reading and processing the raw CSV files.
-
-For example:
-
-```text
-S3
-└── Complete raw telemetry
-
-DynamoDB
-└── T-04
-    ├── batch 1 summary
-    ├── batch 2 summary
-    └── batch 3 summary
-```
-
-## Technologies
-
-* Python
-* AWS SDK for Python (`boto3`)
-* Amazon S3
-* AWS Lambda
-* Amazon DynamoDB
-* Docker
-* LocalStack
-* CSV processing
-
-## Future improvements
-
-Possible extensions include:
-
-* Replace the simulated CSV batches with MQTT telemetry
-* Add AWS IoT Core to the architecture
-* Introduce SQS between ingestion and processing
-* Add more sophisticated anomaly detection
-* Add a dashboard for turbine health
-* Store raw telemetry with partitioned S3 keys
-* Deploy the architecture to AWS
-* Add automated tests for the Lambda processing logic
+* Replace simulated CSV polling with MQTT streaming.
+* Add AWS IoT Core and SQS between S3 ingestion and Lambda processing.
+* Add partitioned S3 storage paths (`year=YYYY/month=MM/day=DD/`).
+* Build a web visualization dashboard for monitoring turbine health.
+* Add `pytest` and `moto` unit test suites for handler testing.
